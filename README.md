@@ -1,6 +1,6 @@
 # nRF52 ST-Link Flasher
 
-Applicazione desktop per programmare **nRF52832** e **nRF52840** tramite **ST-Link V2**, caricando file Intel HEX.
+Applicazione desktop per programmare **nRF52832** e **nRF52840** tramite **ST-Link V2**, caricando file Intel HEX. Supporta il caricamento del **SoftDevice** Nordic insieme al firmware applicativo, inclusi i firmware compilati con **Arduino**.
 
 ## Requisiti
 
@@ -38,8 +38,43 @@ python -m venv .venv
 2. Avvia l'applicazione
 3. Seleziona il microcontrollore (52832 o 52840)
 4. Premi **Aggiorna** per rilevare lo ST-Link
-5. Sfoglia e seleziona il file `.hex`
+5. Sfoglia e seleziona il firmware `.hex` (e, se serve, il SoftDevice `.hex`)
 6. Premi **Programma**
+
+Alla selezione di un file il log mostra l'analisi del layout: applicazione standalone,
+applicazione per MBR, applicazione che richiede un SoftDevice, oppure SoftDevice con
+nome/versione/dimensione letti dall'info struct Nordic a `0x3000`.
+
+### SoftDevice
+
+Il campo **SoftDevice (opz.)** accetta l'HEX ufficiale Nordic (es.
+`s132_nrf52_7.2.0_softdevice.hex`). Si può caricare:
+
+- **solo il firmware** — comportamento classico
+- **solo il SoftDevice** — lascia vuoto il campo firmware
+- **SoftDevice + firmware insieme** — i due HEX vengono uniti e scritti in un unico
+  passaggio, con verifica automatica che il firmware sia linkato dove finisce il
+  SoftDevice (`APP_CODE_BASE`). Sovrapposizioni o file incompatibili vengono
+  bloccati prima di toccare la flash.
+
+> Quando si carica o si cambia SoftDevice è consigliato attivare
+> **Cancella tutta la flash**.
+
+### Firmware Arduino
+
+I core Arduino per nRF52 producono un `.hex` (in Arduino IDE: *Sketch → Esporta
+sketch compilato*, oppure nella cartella di build). A seconda del core:
+
+| Core / configurazione | Inizio app | Cosa selezionare |
+|---|---|---|
+| arduino-nRF5 (sandeepmistry), SoftDevice "None" | `0x0` | solo firmware |
+| arduino-nRF5 con S132 v2.x | `0x1C000` | firmware + `s132_nrf52_2.x` |
+| Adafruit nRF52832 (S132 v6/v7) | `0x26000` | firmware + `s132_nrf52_6/7` |
+| Adafruit nRF52840 (S140 v6/v7) | `0x26000`/`0x27000` | firmware + `s140_nrf52_6/7` |
+
+Il tool rileva l'indirizzo di partenza dell'applicazione e blocca la programmazione
+se il SoftDevice selezionato si sovrappone (avvisa invece se resta un "buco" tra
+fine SoftDevice e inizio applicazione, tipico di una versione SoftDevice sbagliata).
 
 ### Opzioni
 
@@ -50,6 +85,8 @@ python -m venv .venv
   scrive a `0x0` un piccolo trampolino che imposta `VTOR=0x1000` e salta all'app.
   Senza, il chip andrebbe in lockup al reset. Si attiva solo quando serve; lascialo
   attivo se non hai un MBR/SoftDevice/bootloader da programmare separatamente.
+  Se selezioni un SoftDevice l'opzione viene disabilitata: l'MBR vero è già incluso
+  nell'HEX del SoftDevice.
 
 > **Nota APPROTECT:** se il chip è bloccato (APPROTECT attivo), la connessione lo
 > sblocca automaticamente con un mass erase via CTRL-AP. È normale e necessario per

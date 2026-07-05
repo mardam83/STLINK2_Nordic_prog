@@ -4,13 +4,43 @@ from __future__ import annotations
 
 from pathlib import Path
 from tkinter import filedialog, messagebox
+import tkinter as tk
 
 import customtkinter as ctk
 
-from nrf_flasher.flasher import NrfFlasher, ProbeInfo, TargetChip
+from nrf_flasher.flasher import NrfFlasher, PostFlashAction, ProbeInfo, TargetChip, analyze_hex
 
 APP_TITLE = "nRF52 ST-Link Flasher"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
+
+
+class ToolTip:
+    def __init__(self, widget: tk.Widget | ctk.CTkBaseClass, text: str) -> None:
+        self.widget = widget
+        self.text = text
+        self.tw: tk.Toplevel | None = None
+        self.widget.bind("<Enter>", self.enter)
+        self.widget.bind("<Leave>", self.leave)
+
+    def enter(self, event: tk.Event | None = None) -> None:
+        x, y, cx, cy = self.widget.bbox("insert")
+        x += self.widget.winfo_rootx() + 25
+        y += self.widget.winfo_rooty() + 25
+        self.tw = tk.Toplevel(self.widget)
+        self.tw.wm_overrideredirect(True)
+        self.tw.wm_geometry(f"+{x}+{y}")
+        self.tw.attributes('-topmost', True)
+        label = tk.Label(
+            self.tw, text=self.text, justify='left',
+            background="#2b2b2b", foreground="#e0e0e0", relief='solid', borderwidth=1,
+            font=("Segoe UI", "9", "normal"), padx=4, pady=2
+        )
+        label.pack(ipadx=1)
+
+    def leave(self, event: tk.Event | None = None) -> None:
+        if self.tw:
+            self.tw.destroy()
+            self.tw = None
 
 
 class NrfFlasherApp(ctk.CTk):
@@ -22,6 +52,7 @@ class NrfFlasherApp(ctk.CTk):
 
         self._flasher = NrfFlasher()
         self._hex_path: Path | None = None
+        self._sd_path: Path | None = None
         self._probes: list[ProbeInfo] = []
 
         self._build_ui()
@@ -29,11 +60,11 @@ class NrfFlasherApp(ctk.CTk):
 
     def _build_ui(self) -> None:
         self.title(f"{APP_TITLE} v{APP_VERSION}")
-        self.geometry("720x560")
-        self.minsize(640, 480)
+        self.geometry("720x700")
+        self.minsize(640, 600)
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(4, weight=1)
+        self.grid_rowconfigure(5, weight=1)
 
         header = ctk.CTkLabel(
             self,
@@ -44,7 +75,7 @@ class NrfFlasherApp(ctk.CTk):
 
         subtitle = ctk.CTkLabel(
             self,
-            text="ST-Link V2 · caricamento file Intel HEX",
+            text="ST-Link V2 · firmware + SoftDevice (Intel HEX, anche build Arduino)",
             text_color="gray",
         )
         subtitle.grid(row=1, column=0, padx=20, pady=(0, 12), sticky="w")
@@ -88,7 +119,7 @@ class NrfFlasherApp(ctk.CTk):
         )
         self._refresh_btn.grid(row=0, column=1, padx=(8, 0))
 
-        ctk.CTkLabel(form, text="File HEX").grid(
+        ctk.CTkLabel(form, text="Firmware HEX").grid(
             row=2, column=0, padx=12, pady=10, sticky="w"
         )
         hex_row = ctk.CTkFrame(form, fg_color="transparent")
@@ -111,32 +142,137 @@ class NrfFlasherApp(ctk.CTk):
         )
         self._browse_btn.grid(row=0, column=1, padx=(8, 0))
 
+        self._hex_clear_btn = ctk.CTkButton(
+            hex_row,
+            text="✕",
+            width=32,
+            fg_color="transparent",
+            border_width=1,
+            text_color=("gray10", "#DCE4EE"),
+            command=self._clear_hex,
+        )
+        self._hex_clear_btn.grid(row=0, column=2, padx=(6, 0))
+
+        ctk.CTkLabel(form, text="SoftDevice (opz.)").grid(
+            row=3, column=0, padx=12, pady=10, sticky="w"
+        )
+        sd_row = ctk.CTkFrame(form, fg_color="transparent")
+        sd_row.grid(row=3, column=1, padx=12, pady=10, sticky="ew")
+        sd_row.grid_columnconfigure(0, weight=1)
+
+        self._sd_var = ctk.StringVar(value="Nessuno (solo firmware)")
+        self._sd_label = ctk.CTkEntry(
+            sd_row,
+            textvariable=self._sd_var,
+            state="readonly",
+        )
+        self._sd_label.grid(row=0, column=0, sticky="ew")
+
+        self._sd_browse_btn = ctk.CTkButton(
+            sd_row,
+            text="Sfoglia…",
+            width=90,
+            command=self._browse_sd,
+        )
+        self._sd_browse_btn.grid(row=0, column=1, padx=(8, 0))
+
+        self._sd_clear_btn = ctk.CTkButton(
+            sd_row,
+            text="✕",
+            width=32,
+            fg_color="transparent",
+            border_width=1,
+            text_color=("gray10", "#DCE4EE"),
+            command=self._clear_sd,
+        )
+        self._sd_clear_btn.grid(row=0, column=2, padx=(6, 0))
+
         options = ctk.CTkFrame(form, fg_color="transparent")
-        options.grid(row=3, column=0, columnspan=2, padx=12, pady=(4, 12), sticky="w")
+        options.grid(row=4, column=0, columnspan=2, padx=12, pady=(4, 12), sticky="w")
 
         self._erase_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(
+        erase_check = ctk.CTkCheckBox(
             options,
             text="Cancella tutta la flash prima di programmare",
             variable=self._erase_var,
-        ).pack(side="left", padx=(0, 16))
+        )
+        erase_check.pack(side="left", padx=(0, 16))
+        ToolTip(
+            erase_check,
+            "ATTENZIONE: Esegue un 'mass erase' del chip.\n"
+            "Questo cancellerà anche il Bootloader, il SoftDevice e l'UICR.\n"
+            "Usa questa opzione solo se vuoi ripartire da un chip completamente vuoto."
+        )
 
         self._reset_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
+        reset_check = ctk.CTkCheckBox(
             options,
             text="Reset dopo la programmazione",
             variable=self._reset_var,
-        ).pack(side="left", padx=(0, 16))
+        )
+        reset_check.pack(side="left", padx=(0, 16))
+        ToolTip(
+            reset_check,
+            "Esegue un reset hardware (pin o SYSRESETREQ) al termine del flash.\n"
+            "Necessario affinché il nuovo firmware inizi l'esecuzione."
+        )
 
         self._trampoline_var = ctk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
+        self._trampoline_check = ctk.CTkCheckBox(
             options,
             text="Aggiungi trampolino MBR a 0x0 se l'app parte da 0x1000",
             variable=self._trampoline_var,
-        ).pack(side="left")
+        )
+        self._trampoline_check.pack(side="left")
+        ToolTip(
+            self._trampoline_check,
+            "Se stai flashando un'app linkata a 0x1000 (es. OpenThread) senza SoftDevice/MBR,\n"
+            "questa opzione inietta un piccolo 'trampolino' a 0x0 per avviarla.\n"
+            "Se c'è un SoftDevice selezionato, questa opzione viene ignorata."
+        )
+
+        # --- Riga opzioni post-programmazione (radio buttons) ---
+        post_frame = ctk.CTkFrame(form, fg_color="transparent")
+        post_frame.grid(row=5, column=0, columnspan=2, padx=12, pady=(4, 12), sticky="w")
+
+        ctk.CTkLabel(post_frame, text="Dopo la programmazione:", font=ctk.CTkFont(weight="bold")).pack(
+            side="left", padx=(0, 12)
+        )
+
+        self._post_action_var = ctk.StringVar(value=PostFlashAction.ERASE_UICR.value)
+        self._post_action_radios: list[ctk.CTkRadioButton] = []
+
+        action_tooltips = {
+            PostFlashAction.NONE: (
+                "Non modifica alcun registro post-programmazione.\n"
+                "Utile se flashi un SoftDevice o un Bootloader da solo."
+            ),
+            PostFlashAction.ERASE_UICR: (
+                "Cancella l'UICR in modo che il SoftDevice non trovi il bootloader.\n"
+                "L'applicazione si avvierà ignorando i controlli CRC.\n"
+                "ATTENZIONE: questo disabiliterà gli aggiornamenti OTA via BLE."
+            ),
+            PostFlashAction.WRITE_BL_SETTINGS: (
+                "Simula il processo di nrfutil: calcola il CRC-16 dell'app\n"
+                "e scrive la pagina Bootloader Settings (0x7F000).\n"
+                "L'Adafruit Bootloader validerà l'app e la avvierà normalmente.\n"
+                "CONSIGLIATO: Mantiene attivi gli aggiornamenti OTA via BLE."
+            ),
+        }
+
+        for action in PostFlashAction:
+            rb = ctk.CTkRadioButton(
+                post_frame,
+                text=action.label,
+                variable=self._post_action_var,
+                value=action.value,
+            )
+            rb.pack(side="left", padx=(0, 12))
+            ToolTip(rb, action_tooltips[action])
+            self._post_action_radios.append(rb)
 
         actions = ctk.CTkFrame(self, fg_color="transparent")
-        actions.grid(row=3, column=0, padx=20, pady=4, sticky="ew")
+        actions.grid(row=4, column=0, padx=20, pady=4, sticky="ew")
 
         self._flash_btn = ctk.CTkButton(
             actions,
@@ -165,7 +301,7 @@ class NrfFlasherApp(ctk.CTk):
         )
 
         log_frame = ctk.CTkFrame(self)
-        log_frame.grid(row=4, column=0, padx=20, pady=(8, 20), sticky="nsew")
+        log_frame.grid(row=5, column=0, padx=20, pady=(8, 20), sticky="nsew")
         log_frame.grid_rowconfigure(1, weight=1)
         log_frame.grid_columnconfigure(0, weight=1)
 
@@ -189,15 +325,37 @@ class NrfFlasherApp(ctk.CTk):
         self._flash_btn.configure(state=state)
         self._erase_btn.configure(state=state)
         self._browse_btn.configure(state=state)
+        self._hex_clear_btn.configure(state=state)
+        self._sd_browse_btn.configure(state=state)
+        self._sd_clear_btn.configure(state=state)
         self._refresh_btn.configure(state=state)
         self._target_menu.configure(state=state)
         self._probe_menu.configure(state=state)
         if not busy:
             self._status_var.set("Pronto")
+            self._update_trampoline_state()
+        for rb in self._post_action_radios:
+            rb.configure(state=state)
+
+    def _update_trampoline_state(self) -> None:
+        # Con un SoftDevice selezionato l'MBR è già incluso: il trampolino
+        # non serve e viene disabilitato per chiarezza.
+        if self._sd_path is not None:
+            self._trampoline_check.configure(state="disabled")
+        else:
+            self._trampoline_check.configure(state="normal")
+
+    def _log_hex_analysis(self, path: Path, role: str) -> None:
+        try:
+            info = analyze_hex(path)
+        except Exception as exc:  # noqa: BLE001 — analisi solo informativa
+            self._log(f"Impossibile analizzare {path.name}: {exc}")
+            return
+        self._log(f"{role}: {info.description}")
 
     def _browse_hex(self) -> None:
         path = filedialog.askopenfilename(
-            title="Seleziona file HEX",
+            title="Seleziona firmware HEX",
             filetypes=[
                 ("Intel HEX", "*.hex"),
                 ("Tutti i file", "*.*"),
@@ -206,7 +364,32 @@ class NrfFlasherApp(ctk.CTk):
         if path:
             self._hex_path = Path(path)
             self._hex_var.set(str(self._hex_path))
-            self._log(f"Selezionato: {self._hex_path.name}")
+            self._log(f"Selezionato firmware: {self._hex_path.name}")
+            self._log_hex_analysis(self._hex_path, "Analisi firmware")
+
+    def _clear_hex(self) -> None:
+        self._hex_path = None
+        self._hex_var.set("Nessun file selezionato")
+
+    def _browse_sd(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Seleziona SoftDevice HEX",
+            filetypes=[
+                ("Intel HEX", "*.hex"),
+                ("Tutti i file", "*.*"),
+            ],
+        )
+        if path:
+            self._sd_path = Path(path)
+            self._sd_var.set(str(self._sd_path))
+            self._log(f"Selezionato SoftDevice: {self._sd_path.name}")
+            self._log_hex_analysis(self._sd_path, "Analisi SoftDevice")
+            self._update_trampoline_state()
+
+    def _clear_sd(self) -> None:
+        self._sd_path = None
+        self._sd_var.set("Nessuno (solo firmware)")
+        self._update_trampoline_state()
 
     def _refresh_probes(self) -> None:
         self._log("Ricerca probe ST-Link…")
@@ -248,8 +431,11 @@ class NrfFlasherApp(ctk.CTk):
         if self._flasher.busy:
             return
 
-        if self._hex_path is None:
-            messagebox.showwarning("File mancante", "Seleziona un file HEX.")
+        if self._hex_path is None and self._sd_path is None:
+            messagebox.showwarning(
+                "File mancante",
+                "Seleziona un firmware HEX e/o un SoftDevice.",
+            )
             return
 
         if not self._probes:
@@ -259,9 +445,14 @@ class NrfFlasherApp(ctk.CTk):
             )
             return
 
+        parts = []
+        if self._sd_path is not None:
+            parts.append(f"SoftDevice {self._sd_path.name}")
+        if self._hex_path is not None:
+            parts.append(f"firmware {self._hex_path.name}")
         if not messagebox.askyesno(
             "Conferma",
-            f"Programmare {self._hex_path.name} su {self._target_var.get()}?",
+            f"Programmare {' + '.join(parts)} su {self._target_var.get()}?",
         ):
             return
 
@@ -279,6 +470,8 @@ class NrfFlasherApp(ctk.CTk):
             on_log=self._log,
             on_done=self._on_flash_done,
             add_mbr_trampoline=self._trampoline_var.get(),
+            softdevice_path=self._sd_path,
+            post_flash_action=PostFlashAction(self._post_action_var.get()),
         )
 
     def _start_erase(self) -> None:
