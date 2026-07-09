@@ -72,16 +72,46 @@ sketch compilato*, oppure nella cartella di build). A seconda del core:
 | Adafruit nRF52832 (S132 v6/v7) | `0x26000` | firmware + `s132_nrf52_6/7` |
 | Adafruit nRF52840 (S140 v6/v7) | `0x26000`/`0x27000` | firmware + `s140_nrf52_6/7` |
 
-Il tool rileva l'indirizzo di partenza dell'applicazione e blocca la programmazione
-se il SoftDevice selezionato si sovrappone (avvisa invece se resta un "buco" tra
-fine SoftDevice e inizio applicazione, tipico di una versione SoftDevice sbagliata).
+### Firmware Zephyr / MCUboot (tab "MCUboot (Zephyr)")
 
-### Opzioni
+Terza scheda dedicata al progetto **TendaVibrationZephyr** (nRF Connect SDK con
+bootloader MCUboot). Due modalità, preselezionate automaticamente in base al
+file (riconoscimento dell'header immagine MCUboot a `0xC000`):
+
+- **Chip completo (`merged.hex`)** — mass erase + MCUboot + applicazione
+  firmata. Da usare al primo flash o per migrare un modulo dal bootloader
+  Adafruit. Cancella tutto: vecchio bootloader, SoftDevice, UICR, soglie.
+- **Solo applicazione (`zephyr.signed.hex`)** — scrive l'app nello slot
+  primario conservando MCUboot e la partizione settings.
+
+Probe ST-Link e microcontrollore si selezionano nel tab "Cavo ST-Link". Le
+azioni post-flash legacy (UICR/CRC) non servono: MCUboot valida le immagini
+con la propria firma. Gli aggiornamenti OTA dei moduli MCUboot usano il
+protocollo **SMP** (app nRF Connect Device Manager o `smpclient`), non la
+scheda "OTA BLE" (DFU legacy Adafruit).
+
+## Caratteristiche
+- Interfaccia a tre schede (Tabview): **Cavo ST-Link**, **OTA BLE** e **MCUboot (Zephyr)**.
+- Programmazione di file Intel HEX tramite sonda ST-Link V2 (via pyOCD).
+- (Nuovo) **Aggiornamento Firmware OTA (Over-The-Air)** senza fili usando la connessione Bluetooth del PC e il pacchetto `.zip` di Arduino.
+- Scansione Bluetooth integrata per trovare il dispositivo senza hardcodare i MAC address.
+- Estrazione automatica della porzione dell'applicazione dall'HEX.
+- Generazione CRC-16 CCITT per simulare i pacchetti `nrfutil` e mantenere compatibilità OTA del bootloader Adafruit.
+- Iniezione "trampolino" MBR a `0x0` per le app compilate per l'indirizzo `0x1000` (es. varianti OpenThread).
+- Operazioni di mass erase e riavvio software/hardware automatizzate.
+
+## Requisiti
+
+- Windows / Linux / macOS
+- Python 3.10+
+- Installare le dipendenze: `pip install -r requirements.txt` (include `pyocd`, `customtkinter`, `intelhex`, e `bleak`). 
+
+## Opzioni
 
 - **Cancella tutta la flash** — esegue un mass erase prima della scrittura
 - **Reset dopo la programmazione** — riavvia il firmware appena caricato (consigliato)
 - **Aggiungi trampolino MBR a 0x0** — se l'HEX è linkato a `0x1000` e lascia `0x0`
-  vuoto (tipico delle app nRF5 SDK come `ot-rcp`, che girano sotto il Nordic MBR),
+  vuoto (tipico delle app nRF SDK come `ot-rcp`, che girano sotto il Nordic MBR),
   scrive a `0x0` un piccolo trampolino che imposta `VTOR=0x1000` e salta all'app.
   Senza, il chip andrebbe in lockup al reset. Si attiva solo quando serve; lascialo
   attivo se non hai un MBR/SoftDevice/bootloader da programmare separatamente.

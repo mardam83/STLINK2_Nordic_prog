@@ -158,6 +158,86 @@ def analyze_hex(path: Path) -> HexInfo:
     )
 
 
+# ---------------------------------------------------------------------------
+# MCUboot (progetto Zephyr TendaVibrationZephyr).
+# Layout fisso di pm_static.yml: MCUboot a 0x0, slot primario a 0xC000.
+# Un'immagine firmata inizia con l'header MCUboot: magic IH_MAGIC a offset 0
+# dell'immagine, cioè a 0xC000 in flash.
+# ---------------------------------------------------------------------------
+_MCUBOOT_SLOT0_ADDR = 0xC000
+_MCUBOOT_IH_MAGIC = 0x96F3B83D
+
+
+@dataclass
+class McubootHexInfo:
+    """Risultato dell'analisi di un HEX per il flusso MCUboot."""
+
+    kind: str  # "merged" | "app" | "unknown"
+    description: str
+
+
+def analyze_mcuboot_hex(path: Path) -> McubootHexInfo:
+    """Classifica un HEX del progetto Zephyr (merged vs app firmata).
+
+    - ``merged``: dati a 0x0 (bootloader) + header immagine a 0xC000
+      (``merged.hex`` di sysbuild) -> richiede programmazione chip completo.
+    - ``app``: nessun dato sotto 0xC000 ma header immagine a 0xC000
+      (``zephyr.signed.hex``) -> aggiornamento solo applicazione.
+    - ``unknown``: tutto il resto (probabilmente non è una build sysbuild
+      del progetto Zephyr con il layout di pm_static.yml).
+    """
+    from intelhex import IntelHex
+
+    ihex = IntelHex(str(path))
+    flash_segs = [(s, e) for s, e in ihex.segments() if s < _FLASH_REGION_END]
+    if not flash_segs:
+        raise ValueError("il file non contiene dati in flash")
+
+    min_addr = min(s for s, _ in flash_segs)
+    max_addr = max(e for _, e in flash_segs)
+    has_bootloader = min_addr < APP_VECTOR_TABLE_ADDR
+
+    try:
+        slot0_magic = _read_u32(ihex, _MCUBOOT_SLOT0_ADDR)
+    except Exception:  # noqa: BLE001 — nessun dato a 0xC000
+        slot0_magic = 0
+    has_image_header = slot0_magic == _MCUBOOT_IH_MAGIC
+
+    if has_bootloader and has_image_header:
+        return McubootHexInfo(
+            kind="merged",
+            description=(
+                f"immagine completa MCUboot + app firmata (merged.hex, "
+                f"0x{min_addr:X}–0x{max_addr:X}): usare 'Chip completo'"
+            ),
+        )
+    if has_image_header and min_addr >= _MCUBOOT_SLOT0_ADDR:
+        return McubootHexInfo(
+            kind="app",
+            description=(
+                f"applicazione firmata MCUboot (slot primario 0x{min_addr:X}–"
+                f"0x{max_addr:X}): ok per 'Solo applicazione'"
+            ),
+        )
+    if has_bootloader:
+        return McubootHexInfo(
+            kind="unknown",
+            description=(
+                f"dati a 0x{min_addr:X} ma nessun header immagine MCUboot a "
+                f"0x{_MCUBOOT_SLOT0_ADDR:X}: non sembra una build sysbuild del "
+                "progetto Zephyr (layout pm_static.yml)"
+            ),
+        )
+    return McubootHexInfo(
+        kind="unknown",
+        description=(
+            f"nessun header immagine MCUboot a 0x{_MCUBOOT_SLOT0_ADDR:X} "
+            f"(dati 0x{min_addr:X}–0x{max_addr:X}): verificare di aver "
+            "selezionato merged.hex o zephyr.signed.hex"
+        ),
+    )
+
+
 def build_mbr_trampoline(app_hex: "IntelHex") -> "IntelHex | None":
     """Costruisce la pagina 0x0 col trampolino MBR, se l'HEX ne ha bisogno.
 

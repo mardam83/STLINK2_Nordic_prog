@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 from pathlib import Path
+import asyncio
 from tkinter import filedialog, messagebox
 import tkinter as tk
 
 import customtkinter as ctk
 
-from nrf_flasher.flasher import NrfFlasher, PostFlashAction, ProbeInfo, TargetChip, analyze_hex
+from nrf_flasher.flasher import (
+    NrfFlasher,
+    PostFlashAction,
+    ProbeInfo,
+    TargetChip,
+    analyze_hex,
+    analyze_mcuboot_hex,
+)
+from nrf_flasher.ota import OtaFlasher, scan_ble_devices, BleDeviceInfo
 
-APP_TITLE = "nRF52 ST-Link Flasher"
-APP_VERSION = "1.2.0"
+APP_TITLE = "nRF52 Programmer & OTA"
+APP_VERSION = "2.1.0"
 
 
 class ToolTip:
@@ -51,9 +60,14 @@ class NrfFlasherApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self._flasher = NrfFlasher()
+        self._ota_flasher = OtaFlasher()
         self._hex_path: Path | None = None
         self._sd_path: Path | None = None
+        self._ota_zip_path: Path | None = None
+        self._mcuboot_hex_path: Path | None = None
+        self._mcuboot_hex_kind: str = "unknown"
         self._probes: list[ProbeInfo] = []
+        self._ble_devices: list[BleDeviceInfo] = []
 
         self._build_ui()
         self.after(300, self._refresh_probes)
@@ -75,13 +89,27 @@ class NrfFlasherApp(ctk.CTk):
 
         subtitle = ctk.CTkLabel(
             self,
-            text="ST-Link V2 · firmware + SoftDevice (Intel HEX, anche build Arduino)",
+            text="Supporta ST-Link V2 (via pyOCD) e DFU OTA (Bluetooth LE)",
             text_color="gray",
         )
-        subtitle.grid(row=1, column=0, padx=20, pady=(0, 12), sticky="w")
+        subtitle.grid(row=1, column=0, padx=20, pady=(0, 4), sticky="w")
 
-        form = ctk.CTkFrame(self)
-        form.grid(row=2, column=0, padx=20, pady=8, sticky="ew")
+        # --- TABVIEW ---
+        self.tabview = ctk.CTkTabview(self)
+        self.tabview.grid(row=2, column=0, padx=20, pady=8, sticky="nsew")
+        self.tab_stlink = self.tabview.add("Cavo ST-Link")
+        self.tab_ota = self.tabview.add("OTA BLE")
+        self.tab_mcuboot = self.tabview.add("MCUboot (Zephyr)")
+
+        self.tab_stlink.grid_columnconfigure(0, weight=1)
+        self.tab_ota.grid_columnconfigure(0, weight=1)
+        self.tab_mcuboot.grid_columnconfigure(0, weight=1)
+
+        # ==========================================
+        # TAB 1: ST-LINK
+        # ==========================================
+        form = ctk.CTkFrame(self.tab_stlink)
+        form.grid(row=0, column=0, padx=0, pady=0, sticky="ew")
         form.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(form, text="Microcontrollore").grid(
@@ -300,6 +328,200 @@ class NrfFlasherApp(ctk.CTk):
             side="left", padx=16
         )
 
+        # ==========================================
+        # TAB 2: OTA BLE
+        # ==========================================
+        ota_form = ctk.CTkFrame(self.tab_ota)
+        ota_form.grid(row=0, column=0, padx=0, pady=0, sticky="ew")
+        ota_form.grid_columnconfigure(1, weight=1)
+
+        # Riga 1: Scanner e Selezione Dispositivo
+        ctk.CTkLabel(ota_form, text="Dispositivo BLE").grid(
+            row=0, column=0, padx=12, pady=10, sticky="w"
+        )
+        ble_row = ctk.CTkFrame(ota_form, fg_color="transparent")
+        ble_row.grid(row=0, column=1, padx=12, pady=10, sticky="ew")
+        ble_row.grid_columnconfigure(0, weight=1)
+
+        self._ble_var = ctk.StringVar(value="(nessun dispositivo)")
+        self._ble_menu = ctk.CTkOptionMenu(
+            ble_row,
+            variable=self._ble_var,
+            values=["(nessun dispositivo)"],
+        )
+        self._ble_menu.grid(row=0, column=0, sticky="ew")
+
+        self._scan_btn = ctk.CTkButton(
+            ble_row,
+            text="Scansiona",
+            width=90,
+            command=self._start_ble_scan,
+        )
+        self._scan_btn.grid(row=0, column=1, padx=(8, 0))
+
+        # Riga 2: Selezione File ZIP
+        ctk.CTkLabel(ota_form, text="Pacchetto OTA (.zip)").grid(
+            row=1, column=0, padx=12, pady=10, sticky="w"
+        )
+        zip_row = ctk.CTkFrame(ota_form, fg_color="transparent")
+        zip_row.grid(row=1, column=1, padx=12, pady=10, sticky="ew")
+        zip_row.grid_columnconfigure(0, weight=1)
+
+        self._zip_var = ctk.StringVar(value="Nessun file selezionato")
+        self._zip_label = ctk.CTkEntry(
+            zip_row,
+            textvariable=self._zip_var,
+            state="readonly",
+        )
+        self._zip_label.grid(row=0, column=0, sticky="ew")
+
+        self._zip_browse_btn = ctk.CTkButton(
+            zip_row,
+            text="Sfoglia…",
+            width=90,
+            command=self._browse_zip,
+        )
+        self._zip_browse_btn.grid(row=0, column=1, padx=(8, 0))
+
+        # Riga 3: Barra di progresso
+        self._ota_progress = ctk.CTkProgressBar(ota_form)
+        self._ota_progress.grid(row=2, column=0, columnspan=2, padx=12, pady=(10, 4), sticky="ew")
+        self._ota_progress.set(0)
+
+        # Azioni OTA
+        ota_actions = ctk.CTkFrame(self.tab_ota, fg_color="transparent")
+        ota_actions.grid(row=1, column=0, padx=20, pady=(16, 4), sticky="ew")
+
+        self._ota_flash_btn = ctk.CTkButton(
+            ota_actions,
+            text="Avvia Aggiornamento OTA",
+            height=40,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            command=self._start_ota_flash,
+        )
+        self._ota_flash_btn.pack(side="left")
+
+        self._ota_status_var = ctk.StringVar(value="Pronto")
+        ctk.CTkLabel(ota_actions, textvariable=self._ota_status_var).pack(
+            side="left", padx=16
+        )
+
+        # ==========================================
+        # TAB 3: MCUBOOT (ZEPHYR)
+        # ==========================================
+        # Programmazione via cavo del firmware Zephyr (TendaVibrationZephyr)
+        # con bootloader MCUboot. Probe ST-Link e microcontrollore si scelgono
+        # nel tab "Cavo ST-Link".
+        mcuboot_form = ctk.CTkFrame(self.tab_mcuboot)
+        mcuboot_form.grid(row=0, column=0, padx=0, pady=0, sticky="ew")
+        mcuboot_form.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            mcuboot_form,
+            text="Firmware Zephyr con bootloader MCUboot. Probe e chip si "
+                 "selezionano nel tab \"Cavo ST-Link\".",
+            text_color="gray",
+            wraplength=560,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, padx=12, pady=(10, 4), sticky="w")
+
+        ctk.CTkLabel(mcuboot_form, text="File HEX").grid(
+            row=1, column=0, padx=12, pady=10, sticky="w"
+        )
+        mcuboot_hex_row = ctk.CTkFrame(mcuboot_form, fg_color="transparent")
+        mcuboot_hex_row.grid(row=1, column=1, padx=12, pady=10, sticky="ew")
+        mcuboot_hex_row.grid_columnconfigure(0, weight=1)
+
+        self._mcuboot_hex_var = ctk.StringVar(value="Nessun file selezionato")
+        self._mcuboot_hex_label = ctk.CTkEntry(
+            mcuboot_hex_row,
+            textvariable=self._mcuboot_hex_var,
+            state="readonly",
+        )
+        self._mcuboot_hex_label.grid(row=0, column=0, sticky="ew")
+
+        self._mcuboot_browse_btn = ctk.CTkButton(
+            mcuboot_hex_row,
+            text="Sfoglia…",
+            width=90,
+            command=self._browse_mcuboot_hex,
+        )
+        self._mcuboot_browse_btn.grid(row=0, column=1, padx=(8, 0))
+
+        self._mcuboot_clear_btn = ctk.CTkButton(
+            mcuboot_hex_row,
+            text="✕",
+            width=32,
+            fg_color="transparent",
+            border_width=1,
+            text_color=("gray10", "#DCE4EE"),
+            command=self._clear_mcuboot_hex,
+        )
+        self._mcuboot_clear_btn.grid(row=0, column=2, padx=(6, 0))
+
+        # Modalità di programmazione
+        mcuboot_mode_frame = ctk.CTkFrame(mcuboot_form, fg_color="transparent")
+        mcuboot_mode_frame.grid(row=2, column=0, columnspan=2, padx=12, pady=(4, 12), sticky="w")
+
+        ctk.CTkLabel(
+            mcuboot_mode_frame, text="Modalità:", font=ctk.CTkFont(weight="bold")
+        ).pack(side="left", padx=(0, 12))
+
+        self._mcuboot_mode_var = ctk.StringVar(value="merged")
+        self._mcuboot_mode_radios: list[ctk.CTkRadioButton] = []
+
+        rb_merged = ctk.CTkRadioButton(
+            mcuboot_mode_frame,
+            text="Chip completo (merged.hex)",
+            variable=self._mcuboot_mode_var,
+            value="merged",
+        )
+        rb_merged.pack(side="left", padx=(0, 12))
+        ToolTip(
+            rb_merged,
+            "Mass erase + scrittura di MCUboot e applicazione firmata.\n"
+            "Da usare al primo flash o per migrare un modulo dal bootloader\n"
+            "Adafruit. ATTENZIONE: cancella tutto, incluso il vecchio\n"
+            "bootloader, il SoftDevice, l'UICR e le soglie salvate."
+        )
+        self._mcuboot_mode_radios.append(rb_merged)
+
+        rb_app = ctk.CTkRadioButton(
+            mcuboot_mode_frame,
+            text="Solo applicazione (zephyr.signed.hex)",
+            variable=self._mcuboot_mode_var,
+            value="app",
+        )
+        rb_app.pack(side="left", padx=(0, 12))
+        ToolTip(
+            rb_app,
+            "Scrive solo l'applicazione firmata nello slot primario (0xC000).\n"
+            "Conserva MCUboot e la partizione settings (soglie classificatore).\n"
+            "Richiede che sul modulo ci sia già MCUboot."
+        )
+        self._mcuboot_mode_radios.append(rb_app)
+
+        # Azioni MCUboot
+        mcuboot_actions = ctk.CTkFrame(self.tab_mcuboot, fg_color="transparent")
+        mcuboot_actions.grid(row=1, column=0, padx=20, pady=(16, 4), sticky="ew")
+
+        self._mcuboot_flash_btn = ctk.CTkButton(
+            mcuboot_actions,
+            text="Programma",
+            height=40,
+            font=ctk.CTkFont(size=15, weight="bold"),
+            command=self._start_mcuboot_flash,
+        )
+        self._mcuboot_flash_btn.pack(side="left")
+
+        self._mcuboot_status_var = ctk.StringVar(value="Pronto")
+        ctk.CTkLabel(mcuboot_actions, textvariable=self._mcuboot_status_var).pack(
+            side="left", padx=16
+        )
+
+        # ==========================================
+        # LOG FRAME (Comune)
+        # ==========================================
         log_frame = ctk.CTkFrame(self)
         log_frame.grid(row=5, column=0, padx=20, pady=(8, 20), sticky="nsew")
         log_frame.grid_rowconfigure(1, weight=1)
@@ -320,6 +542,229 @@ class NrfFlasherApp(ctk.CTk):
 
         self.after(0, append)
 
+    def _on_flash_done(self, success: bool, error_msg: str | None) -> None:
+        if success:
+            self._status_var.set("Operazione completata")
+        else:
+            self._status_var.set("Errore")
+        self._set_busy(False)
+        if error_msg:
+            messagebox.showerror("Errore di programmazione", error_msg)
+
+    # --- METODI OTA BLE ---
+
+    def _start_ble_scan(self) -> None:
+        self._log("Avvio scansione BLE (3 secondi)...")
+        self._scan_btn.configure(state="disabled")
+        self._ble_menu.configure(state="disabled")
+        self._ble_var.set("Scansione in corso...")
+        
+        def run_scan() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                devices = loop.run_until_complete(scan_ble_devices(3.0))
+                self.after(0, self._on_scan_done, devices)
+            except Exception as e:
+                self.after(0, lambda: self._log(f"Errore scansione: {e}"))
+                self.after(0, self._on_scan_done, [])
+            finally:
+                loop.close()
+
+        import threading
+        threading.Thread(target=run_scan, daemon=True).start()
+
+    def _on_scan_done(self, devices: list[BleDeviceInfo]) -> None:
+        self._scan_btn.configure(state="normal")
+        self._ble_devices = devices
+        
+        if not devices:
+            self._ble_var.set("(nessun dispositivo trovato)")
+            self._ble_menu.configure(values=["(nessun dispositivo trovato)"], state="disabled")
+            self._log("Nessun dispositivo BLE trovato.")
+            return
+
+        values = []
+        dfu_idx = 0
+        for i, d in enumerate(devices):
+            prefix = "[DFU] " if d.is_dfu else ""
+            values.append(f"{prefix}{d.name} ({d.address})")
+            if d.is_dfu and dfu_idx == 0:
+                dfu_idx = i
+
+        self._ble_menu.configure(values=values, state="normal")
+        self._ble_var.set(values[dfu_idx])
+        self._log(f"Trovati {len(devices)} dispositivi.")
+
+    def _browse_zip(self) -> None:
+        path_str = filedialog.askopenfilename(
+            title="Seleziona Pacchetto DFU OTA",
+            filetypes=[("Archivi ZIP", "*.zip")],
+        )
+        if path_str:
+            self._ota_zip_path = Path(path_str)
+            self._zip_var.set(self._ota_zip_path.name)
+            self._log(f"Selezionato pacchetto OTA: {self._ota_zip_path}")
+
+    def _start_ota_flash(self) -> None:
+        if not self._ota_zip_path:
+            messagebox.showwarning("Attenzione", "Seleziona prima un pacchetto .zip")
+            return
+
+        sel_str = self._ble_var.get()
+        if "(nessun" in sel_str or not self._ble_devices:
+            messagebox.showwarning("Attenzione", "Seleziona un dispositivo BLE")
+            return
+
+        try:
+            mac_address = sel_str.split("(")[-1].split(")")[0]
+        except Exception:
+            self._log("Impossibile determinare il MAC address.")
+            return
+
+        self._set_busy(True)
+        self._ota_status_var.set("In esecuzione...")
+        self._ota_progress.set(0)
+        self._log("\n--- INIZIO AGGIORNAMENTO OTA BLE ---")
+        
+        self._ota_flasher.flash_async(
+            zip_path=self._ota_zip_path,
+            mac_address=mac_address,
+            on_log=self._log,
+            on_progress=self._update_ota_progress,
+            on_done=self._on_ota_flash_done,
+        )
+
+    def _update_ota_progress(self, progress: float) -> None:
+        self.after(0, lambda: self._ota_progress.set(progress))
+
+    def _on_ota_flash_done(self, success: bool, msg: str) -> None:
+        self._log(msg)
+        if success:
+            self._ota_status_var.set("Completato")
+            self._ota_progress.set(1.0)
+        else:
+            self._ota_status_var.set("Errore")
+        self._set_busy(False)
+        if not success:
+            messagebox.showerror("Errore OTA", msg)
+
+    # --- METODI MCUBOOT (ZEPHYR) ---
+
+    def _browse_mcuboot_hex(self) -> None:
+        path_str = filedialog.askopenfilename(
+            title="Seleziona merged.hex o zephyr.signed.hex",
+            filetypes=[
+                ("Intel HEX", "*.hex"),
+                ("Tutti i file", "*.*"),
+            ],
+        )
+        if not path_str:
+            return
+        self._mcuboot_hex_path = Path(path_str)
+        self._mcuboot_hex_var.set(str(self._mcuboot_hex_path))
+        self._log(f"Selezionato firmware MCUboot: {self._mcuboot_hex_path.name}")
+        try:
+            info = analyze_mcuboot_hex(self._mcuboot_hex_path)
+        except Exception as exc:  # noqa: BLE001 — analisi solo informativa
+            self._mcuboot_hex_kind = "unknown"
+            self._log(f"Impossibile analizzare {self._mcuboot_hex_path.name}: {exc}")
+            return
+        self._mcuboot_hex_kind = info.kind
+        self._log(f"Analisi firmware: {info.description}")
+        # preseleziona la modalità coerente col file scelto
+        if info.kind in ("merged", "app"):
+            self._mcuboot_mode_var.set(info.kind)
+
+    def _clear_mcuboot_hex(self) -> None:
+        self._mcuboot_hex_path = None
+        self._mcuboot_hex_kind = "unknown"
+        self._mcuboot_hex_var.set("Nessun file selezionato")
+
+    def _start_mcuboot_flash(self) -> None:
+        if self._flasher.busy:
+            return
+
+        if self._mcuboot_hex_path is None:
+            messagebox.showwarning(
+                "File mancante",
+                "Seleziona un file HEX (merged.hex o zephyr.signed.hex).",
+            )
+            return
+
+        if not self._probes:
+            messagebox.showwarning(
+                "ST-Link non trovato",
+                "Collega un ST-Link V2 e premi Aggiorna nel tab \"Cavo ST-Link\".",
+            )
+            return
+
+        mode = self._mcuboot_mode_var.get()
+
+        # coerenza file/modalità: un merged.hex flashato senza mass erase o una
+        # app firmata flashata con mass erase lasciano il modulo non avviabile
+        if self._mcuboot_hex_kind != "unknown" and self._mcuboot_hex_kind != mode:
+            expected = (
+                "Chip completo" if self._mcuboot_hex_kind == "merged"
+                else "Solo applicazione"
+            )
+            if not messagebox.askyesno(
+                "Modalità incoerente",
+                f"Il file selezionato sembra richiedere la modalità "
+                f"\"{expected}\", ma è selezionata l'altra.\n"
+                "Continuare comunque?",
+                icon="warning",
+            ):
+                return
+        if self._mcuboot_hex_kind == "unknown":
+            if not messagebox.askyesno(
+                "File non riconosciuto",
+                "Il file non sembra una build sysbuild del progetto Zephyr "
+                "(nessun header immagine MCUboot a 0xC000).\n"
+                "Continuare comunque?",
+                icon="warning",
+            ):
+                return
+
+        if mode == "merged":
+            confirm_msg = (
+                f"Programmare {self._mcuboot_hex_path.name} su "
+                f"{self._target_var.get()} con CANCELLAZIONE COMPLETA?\n\n"
+                "Verranno cancellati il vecchio bootloader (Adafruit), il "
+                "SoftDevice, l'UICR e le soglie salvate."
+            )
+        else:
+            confirm_msg = (
+                f"Aggiornare la sola applicazione con "
+                f"{self._mcuboot_hex_path.name} su {self._target_var.get()}?\n\n"
+                "MCUboot e la partizione settings restano intatti."
+            )
+        if not messagebox.askyesno("Conferma", confirm_msg,
+                                   icon="warning" if mode == "merged" else "question"):
+            return
+
+        self._set_busy(True)
+        self._mcuboot_status_var.set("Programmazione in corso…")
+        self._log("—" * 40)
+        self._log(f"Avvio programmazione MCUboot ({'chip completo' if mode == 'merged' else 'solo applicazione'})…")
+
+        # Niente trampolino MBR né azioni post-flash legacy: MCUboot valida le
+        # immagini con la propria firma, non servono UICR/CRC del mondo Adafruit.
+        self._flasher.flash_async(
+            hex_path=self._mcuboot_hex_path,
+            target=self._selected_target(),
+            probe_uid=self._selected_probe_uid(),
+            erase_all=(mode == "merged"),
+            reset_after=True,
+            on_log=self._log,
+            on_done=self._on_flash_done,
+            add_mbr_trampoline=False,
+            softdevice_path=None,
+            post_flash_action=PostFlashAction.NONE,
+        )
+
+    # --- METODI COMUNI ---
+
     def _set_busy(self, busy: bool) -> None:
         state = "disabled" if busy else "normal"
         self._flash_btn.configure(state=state)
@@ -333,8 +778,22 @@ class NrfFlasherApp(ctk.CTk):
         self._probe_menu.configure(state=state)
         if not busy:
             self._status_var.set("Pronto")
+            self._mcuboot_status_var.set("Pronto")
             self._update_trampoline_state()
         for rb in self._post_action_radios:
+            rb.configure(state=state)
+
+        # OTA Tab
+        self._scan_btn.configure(state=state)
+        self._ble_menu.configure(state=state if not busy and self._ble_devices else "disabled")
+        self._zip_browse_btn.configure(state=state)
+        self._ota_flash_btn.configure(state=state)
+
+        # MCUboot Tab
+        self._mcuboot_browse_btn.configure(state=state)
+        self._mcuboot_clear_btn.configure(state=state)
+        self._mcuboot_flash_btn.configure(state=state)
+        for rb in self._mcuboot_mode_radios:
             rb.configure(state=state)
 
     def _update_trampoline_state(self) -> None:
