@@ -126,82 +126,88 @@ class OtaFlasher:
                     # Utilizza il client BLE
                     async with BleakClient(device, timeout=10.0) as client:
                         on_log(f"Connesso al dispositivo {mac_address}!")
-                
-                    cp_char = client.services.get_service(DFU_SERVICE_UUID).get_characteristic(DFU_CP_UUID)
-                    pkt_char = client.services.get_service(DFU_SERVICE_UUID).get_characteristic(DFU_PKT_UUID)
 
-                    response_queue: asyncio.Queue[bytes] = asyncio.Queue()
+                        service = client.services.get_service(DFU_SERVICE_UUID)
+                        if service is None:
+                            raise RuntimeError(
+                                "Il dispositivo non espone il servizio DFU legacy "
+                                "(0x1530). Se è un modulo Zephyr usa il tab \"OTA Zephyr\"."
+                            )
+                        cp_char = service.get_characteristic(DFU_CP_UUID)
+                        pkt_char = service.get_characteristic(DFU_PKT_UUID)
 
-                    def notification_handler(sender: int, data: bytearray) -> None:
-                        response_queue.put_nowait(bytes(data))
+                        response_queue: asyncio.Queue[bytes] = asyncio.Queue()
 
-                    await client.start_notify(cp_char, notification_handler)
+                        def notification_handler(sender: int, data: bytearray) -> None:
+                            response_queue.put_nowait(bytes(data))
 
-                    async def wait_for_response(expected_opcode: int) -> None:
-                        try:
-                            resp = await asyncio.wait_for(response_queue.get(), timeout=10.0)
-                        except asyncio.TimeoutError:
-                            raise TimeoutError(f"Timeout attesa risposta per opcode 0x{expected_opcode:02X}")
-                    
-                        if resp[0] == OP_RESPONSE and resp[1] == expected_opcode:
-                            if resp[2] != 0x01:
-                                raise Exception(f"Errore dal dispositivo per 0x{expected_opcode:02X}, status: 0x{resp[2]:02X}")
-                        elif resp[0] == OP_PKT_RCPT_NOTIF:
-                            pass # Gestito altrove
-                        else:
-                            raise Exception(f"Risposta imprevista: {resp.hex()}")
+                        await client.start_notify(cp_char, notification_handler)
 
-                    on_log("Avvio DFU...")
-                    await client.write_gatt_char(cp_char, bytes([OP_START_DFU, FW_TYPE_APPLICATION]), response=False)
-                
-                    # Invia dimensione: SoftDevice(0), Bootloader(0), Application(app_size)
-                    size_data = struct.pack("<III", 0, 0, app_size)
-                    await client.write_gatt_char(pkt_char, size_data, response=False)
-                    await wait_for_response(OP_START_DFU)
-
-                    on_log("Inizializzazione DFU...")
-                    await client.write_gatt_char(cp_char, bytes([OP_INIT_DFU, 0x00]), response=False)
-                    await client.write_gatt_char(pkt_char, dat_bytes, response=False)
-                    await client.write_gatt_char(cp_char, bytes([OP_INIT_DFU, 0x01]), response=False)
-                    await wait_for_response(OP_INIT_DFU)
-
-                    on_log("Impostazione PRN (Packet Receipt Notification)...")
-                    await client.write_gatt_char(cp_char, bytes([OP_PKT_RCPT_NOTIF_REQ, PRN_COUNT, 0x00]), response=False)
-
-                    on_log("Trasmissione Firmware...")
-                    await client.write_gatt_char(cp_char, bytes([OP_RECEIVE_FW]), response=False)
-
-                    chunk_size = 20
-                    for i in range(0, app_size, chunk_size):
-                        chunk = bin_bytes[i:i + chunk_size]
-                        await client.write_gatt_char(pkt_char, chunk, response=False)
-                    
-                        # Controlla PRN
-                        packet_idx = (i // chunk_size) + 1
-                        if packet_idx % PRN_COUNT == 0:
+                        async def wait_for_response(expected_opcode: int) -> None:
                             try:
-                                resp = await asyncio.wait_for(response_queue.get(), timeout=5.0)
-                                if resp[0] != OP_PKT_RCPT_NOTIF:
-                                    raise Exception(f"Atteso PRN, ricevuto: {resp.hex()}")
+                                resp = await asyncio.wait_for(response_queue.get(), timeout=10.0)
                             except asyncio.TimeoutError:
-                                raise TimeoutError("Timeout attesa PRN")
-                    
-                        # Calcola il progresso esatto
-                        progress = min((i + chunk_size) / app_size, 1.0)
-                        on_progress(progress)
-                
-                    await wait_for_response(OP_RECEIVE_FW)
-                    on_log("Trasmissione completata. Validazione...")
-                    on_progress(1.0)
+                                raise TimeoutError(f"Timeout attesa risposta per opcode 0x{expected_opcode:02X}")
 
-                    await client.write_gatt_char(cp_char, bytes([OP_VALIDATE]), response=False)
-                    await wait_for_response(OP_VALIDATE)
+                            if resp[0] == OP_RESPONSE and resp[1] == expected_opcode:
+                                if resp[2] != 0x01:
+                                    raise Exception(f"Errore dal dispositivo per 0x{expected_opcode:02X}, status: 0x{resp[2]:02X}")
+                            elif resp[0] == OP_PKT_RCPT_NOTIF:
+                                pass # Gestito altrove
+                            else:
+                                raise Exception(f"Risposta imprevista: {resp.hex()}")
 
-                    on_log("Validazione OK. Riavvio dispositivo...")
-                    await client.write_gatt_char(cp_char, bytes([OP_ACTIVATE_RESET]), response=False)
-                
-                    on_done(True, "Aggiornamento OTA completato con successo!")
-                    return  # Esce dalla funzione e dal ciclo di retry con successo
+                        on_log("Avvio DFU...")
+                        await client.write_gatt_char(cp_char, bytes([OP_START_DFU, FW_TYPE_APPLICATION]), response=False)
+
+                        # Invia dimensione: SoftDevice(0), Bootloader(0), Application(app_size)
+                        size_data = struct.pack("<III", 0, 0, app_size)
+                        await client.write_gatt_char(pkt_char, size_data, response=False)
+                        await wait_for_response(OP_START_DFU)
+
+                        on_log("Inizializzazione DFU...")
+                        await client.write_gatt_char(cp_char, bytes([OP_INIT_DFU, 0x00]), response=False)
+                        await client.write_gatt_char(pkt_char, dat_bytes, response=False)
+                        await client.write_gatt_char(cp_char, bytes([OP_INIT_DFU, 0x01]), response=False)
+                        await wait_for_response(OP_INIT_DFU)
+
+                        on_log("Impostazione PRN (Packet Receipt Notification)...")
+                        await client.write_gatt_char(cp_char, bytes([OP_PKT_RCPT_NOTIF_REQ, PRN_COUNT, 0x00]), response=False)
+
+                        on_log("Trasmissione Firmware...")
+                        await client.write_gatt_char(cp_char, bytes([OP_RECEIVE_FW]), response=False)
+
+                        chunk_size = 20
+                        for i in range(0, app_size, chunk_size):
+                            chunk = bin_bytes[i:i + chunk_size]
+                            await client.write_gatt_char(pkt_char, chunk, response=False)
+
+                            # Controlla PRN
+                            packet_idx = (i // chunk_size) + 1
+                            if packet_idx % PRN_COUNT == 0:
+                                try:
+                                    resp = await asyncio.wait_for(response_queue.get(), timeout=5.0)
+                                    if resp[0] != OP_PKT_RCPT_NOTIF:
+                                        raise Exception(f"Atteso PRN, ricevuto: {resp.hex()}")
+                                except asyncio.TimeoutError:
+                                    raise TimeoutError("Timeout attesa PRN")
+
+                            # Calcola il progresso esatto
+                            progress = min((i + chunk_size) / app_size, 1.0)
+                            on_progress(progress)
+
+                        await wait_for_response(OP_RECEIVE_FW)
+                        on_log("Trasmissione completata. Validazione...")
+                        on_progress(1.0)
+
+                        await client.write_gatt_char(cp_char, bytes([OP_VALIDATE]), response=False)
+                        await wait_for_response(OP_VALIDATE)
+
+                        on_log("Validazione OK. Riavvio dispositivo...")
+                        await client.write_gatt_char(cp_char, bytes([OP_ACTIVATE_RESET]), response=False)
+
+                        on_done(True, "Aggiornamento OTA completato con successo!")
+                        return  # Esce dalla funzione e dal ciclo di retry con successo
 
                 except Exception as e:
                     on_log(f"Errore DFU al tentativo {attempt}: {e}")
@@ -222,6 +228,14 @@ class OtaFlasher:
             manifest_bytes = z.read("manifest.json")
             manifest = json.loads(manifest_bytes.decode('utf-8'))
             
+            # Un pacchetto sysbuild Zephyr ha "files": [...] al livello alto:
+            # se lo riconosciamo qui, l'utente ha sbagliato tab.
+            if "files" in manifest and "manifest" not in manifest:
+                raise ValueError(
+                    "Questo è un pacchetto Zephyr (sysbuild), non un DFU legacy "
+                    "Nordic/Adafruit. Usa il tab \"OTA Zephyr\"."
+                )
+
             app_info = manifest.get("manifest", {}).get("application", {})
             if not app_info:
                 raise ValueError("Nessuna application definita nel manifest.json.")

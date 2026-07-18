@@ -2,3 +2,4 @@ pyocd>=0.36.0
 customtkinter>=5.2.0
 intelhex>=2.3.0
 bleak>=0.21.0
+cbor2>=5.6.0
